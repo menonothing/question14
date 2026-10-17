@@ -1,67 +1,63 @@
-import hashlib
-from fastapi import FastAPI, Request, Response
-from fastapi.responses import JSONResponse
+import jwt
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
-EMAIL = "24f2008930@ds.study.iitm.ac.in"   # already trimmed + lowercase
+ISSUER = "https://idp.exam.local"
+AUDIENCE = "tds-2gehfmbr.apps.exam.local"
+
+PUBLIC_KEY = """-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2okOHspNjgA+2rTLbeuY
+cxiP/hG8C6Sb9iwg3yiLAA4HCnpITcbWCSelbvbYGuc3EbNy4xFyf5Cbj5DHJMID
+EkryOgyd2giIIIBOUBj8S63uGcnRpOBh9NFatfNwheKuzsPuVNldu6A9cNteNpXc
+WyJjG2axVfmq7i6SuKr1JoWYG7xTTAvKPujSl4OtsQfO3h5NepzdfXpr28oNnzfW
+ed+zclR6BcmNNo/WVfJ4xyCLSf0BCOgdTgW6PdaChd1l9VDetJZVEgC5tkyvXsfI
+SI6iyrYbKR0NEBSqq4XkadEjsCs4F1RncsS4LlgniT7GlkL9Mce3b0wGLs9/7ZIX
+dQIDAQAB
+-----END PUBLIC KEY-----"""
 
 app = FastAPI()
-app.add_middleware(CORSMiddleware, allow_origins=["*"],
-                   allow_methods=["*"], allow_headers=["*"],
-                   expose_headers=["*"])
 
-TOOL = {
-    "name": "solve_challenge",
-    "description": "Returns the exam answer for the current request's challenge header.",
-    "inputSchema": {"type": "object", "properties": {}},   # no required props
-}
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-def ok(msg_id, result):
-    return JSONResponse({"jsonrpc": "2.0", "id": msg_id, "result": result})
+INVALID = {"valid": False}
 
-def err(msg_id, code, text):
-    return JSONResponse({"jsonrpc": "2.0", "id": msg_id,
-                         "error": {"code": code, "message": text}})
 
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
+class VerifyRequest(BaseModel):
+    token: str
 
-@app.post("/")
-@app.post("/mcp")
-async def mcp(request: Request):
-    msg = await request.json()
-    method = msg.get("method")
-    msg_id = msg.get("id")
 
-    # Notifications (like notifications/initialized) have no id: just say "got it"
-    if msg_id is None:
-        return Response(status_code=202)
+# If the body is missing or malformed, still answer {"valid": false}
+@app.exception_handler(RequestValidationError)
+async def bad_request(request: Request, exc: RequestValidationError):
+    return JSONResponse(status_code=401, content=INVALID)
 
-    if method == "initialize":
-        client_version = (msg.get("params") or {}).get("protocolVersion", "2025-03-26")
-        return ok(msg_id, {
-            "protocolVersion": client_version,
-            "capabilities": {"tools": {"listChanged": False}},
-            "serverInfo": {"name": "exam-mcp", "version": "1.0.0"},
-        })
 
-    if method == "ping":
-        return ok(msg_id, {})
+@app.post("/verify")
+def verify(req: VerifyRequest):
+    try:
+        claims = jwt.decode(
+            req.token,
+            PUBLIC_KEY,
+            algorithms=["RS256"],       # only accept RS256
+            audience=AUDIENCE,          # checks aud
+            issuer=ISSUER,              # checks iss
+            options={"require": ["exp", "iss", "aud"]},  # these must exist; exp is checked automatically
+        )
+    except jwt.PyJWTError:
+        # covers bad signature, expired, wrong aud/iss, garbage token, etc.
+        return JSONResponse(status_code=401, content=INVALID)
 
-    if method == "tools/list":
-        return ok(msg_id, {"tools": [TOOL]})
-
-    if method == "tools/call":
-        name = (msg.get("params") or {}).get("name")
-        if name != "solve_challenge":
-            return err(msg_id, -32602, "Unknown tool")
-        # The secret note is in the HTTP headers, NOT the JSON body
-        challenge = request.headers.get("x-exam-challenge", "").strip()
-        if not challenge:
-            return ok(msg_id, {"content": [{"type": "text", "text": "missing challenge header"}],
-                               "isError": True})
-        answer = hashlib.sha256(f"{challenge}:{EMAIL}".encode()).hexdigest()[:16]
-        return ok(msg_id, {"content": [{"type": "text", "text": answer}]})
-
-    return err(msg_id, -32601, "Method not found")
+    return {
+        "valid": True,
+        "email": claims.get("email"),
+        "sub": claims.get("sub"),
+        "aud": AUDIENCE,
+    }
